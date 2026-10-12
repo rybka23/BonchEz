@@ -7,7 +7,7 @@ from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from app.services.bonch_client import MarkResult
+from app.services.bonch_client import MarkResult, LessonInfo
 from app.sessions import get_or_restore_client
 from app.runtime import store, auto_enabled
 
@@ -22,7 +22,7 @@ async def cmd_checkin(message: Message):
         await message.answer("Сначала /login")
         return
 
-    status_msg = await message.answer("⏳ Ищу кнопку «Отметиться»...")
+    status_msg = await message.answer("⏳ Гружу расписание и ищу пары для отметки...")
     try:
         result: MarkResult = await client.mark_lesson()
     except Exception as e:
@@ -31,10 +31,7 @@ async def cmd_checkin(message: Message):
         return
 
     if result.success:
-        snippet = result.message[:200] if result.message else "Готово"
-        await status_msg.edit_text(
-            f"✅ Отметка отправлена!\n\n📄 Ответ сервера:\n{snippet}"
-        )
+        await status_msg.edit_text(f"✅ {result.message}")
     else:
         await status_msg.edit_text(f"ℹ️ {result.message}")
 
@@ -59,8 +56,8 @@ async def cmd_auto(message: Message):
         from app import config
         await message.answer(
             "✅ Авто-отметка включена. Каждые "
-            f"{config.AUTO_CHECK_INTERVAL_MIN} мин я буду проверять, "
-            "появилась ли кнопка «Отметиться», и жать её."
+            f"{config.AUTO_CHECK_INTERVAL_MIN} мин я буду проверять расписание "
+            "и пытаться отметиться. После успешной отметки выключу себя."
         )
     else:
         auto_enabled.pop(message.from_user.id, None)

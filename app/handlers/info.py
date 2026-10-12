@@ -1,4 +1,4 @@
-"""Команды /status и /schedule."""
+"""Команды /status, /schedule, /lessons."""
 from __future__ import annotations
 
 import logging
@@ -44,6 +44,7 @@ async def cmd_status(message: Message):
 
 @router.message(Command("schedule"))
 async def cmd_schedule(message: Message):
+    """Показывает расписание на сегодня в виде простого текста."""
     client = await get_or_restore_client(message.from_user.id)
     if not client:
         await message.answer("Сначала /login")
@@ -60,4 +61,39 @@ async def cmd_schedule(message: Message):
         )
     except Exception as e:
         log.exception("Ошибка загрузки расписания")
+        await status_msg.edit_text(f"⚠️ Ошибка: {e}")
+
+
+@router.message(Command("lessons"))
+async def cmd_lessons(message: Message):
+    """
+    Показывает список занятий на сегодня с ID, по которым можно отметиться.
+    Полезно для отладки и для /checkin <ID>.
+    """
+    client = await get_or_restore_client(message.from_user.id)
+    if not client:
+        await message.answer("Сначала /login")
+        return
+
+    status_msg = await message.answer("⏳ Гружу и парсю расписание...")
+    try:
+        html = await client.fetch_today_schedule_html()
+        lessons = client.parse_lessons(html)
+        if not lessons:
+            await status_msg.edit_text(
+                "В расписании на сегодня нет занятий с кнопкой отметки. "
+                "Возможно, сегодня выходной или все пары уже прошли."
+            )
+            return
+
+        lines = [f"📚 Найдено занятий: {len(lessons)}\n"]
+        for i, l in enumerate(lessons, 1):
+            lines.append(
+                f"{i}. {l.time} — {l.subject} ({l.lesson_type})\n"
+                f"   👨‍🏫 {l.teacher}  📍 {l.room}\n"
+                f"   🆔 ID: {l.lesson_id}"
+            )
+        await status_msg.edit_text("\n".join(lines))
+    except Exception as e:
+        log.exception("Ошибка разбора расписания")
         await status_msg.edit_text(f"⚠️ Ошибка: {e}")
