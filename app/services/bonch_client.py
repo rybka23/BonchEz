@@ -124,13 +124,26 @@ class BonchClient:
         self.base_url = base_url.rstrip("/")
         self.cabinet_url = f"{self.base_url}/cabinet/"
 
+        # Общие заголовки — максимальное сходство с браузером.
+        # Без Origin / Sec-Fetch-* nginx Бонча отдаёт 403 на POST к autentificationok.php.
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={
                 "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,application/xhtml+xml;q=0.8,*/*;q=0.7"
+                ),
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate, br, zstd",
                 "Referer": self.cabinet_url,
+                "Origin": self.base_url,
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
                 "X-Requested-With": "XMLHttpRequest",
             },
             follow_redirects=True,
@@ -139,6 +152,18 @@ class BonchClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    def set_cookies(self, cookies: dict[str, str]) -> None:
+        """
+        Вручную установить cookies (например, скопированные из браузера).
+        Полезно для отладки без логина.
+
+        Основная сессионная кука Бонча — `miden`.
+        Также есть `uid` (id пользователя), `_ym_d`/`_ym_uid` (Яндекс.Метрика — не нужны).
+        """
+        for name, value in cookies.items():
+            self._client.cookies.set(name, value, domain="lk.sut.ru")
+        log.info("Установлены cookies: %s", list(cookies.keys()))
 
     # ─────────────────────────────────────────────────────── LOGIN ──
 
@@ -149,14 +174,36 @@ class BonchClient:
         Возвращает PHPSESSID (cookie) — он хранится внутри клиента.
         Бросает BonchLoginError при неудаче.
         """
-        # 1. Заходим на главную, чтобы получить PHPSESSID и куки
-        await self._client.get("/cabinet/")
+        # 1. Заходим на главную, чтобы получить PHPSESSID и куки.
+        #    ВАЖНО: загружаем именно login=yes страницу, как делает браузер
+        #    при форме входа — иначе сервер может не выдать нужные куки.
+        await self._client.get("/cabinet/", params={"login": "no"})
+        await asyncio.sleep(0.3)  # имитируем человека
 
         # 2. POST на autentificationok.php
+        #    Headers подменяем на «ajax-ные» — как делает jQuery:
+        #    Content-Type с charset=UTF-8 + Sec-Fetch-* для same-origin AJAX
         resp = await self._client.post(
             "/cabinet/lib/autentificationok.php",
             data={"users": users, "parole": parole},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Accept": "*/*",
+                "Origin": self.base_url,
+                "Referer": self.cabinet_url,
+                "X-Requested-With": "XMLHttpRequest",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            },
         )
+        # Диагностика: если вернулся HTML (а не число) — это ошибка nginx/WAF
+        if resp.status_code != 200 or "<html" in resp.text.lower()[:200]:
+            raise BonchLoginError(
+                f"Сервер вернул нечисловой ответ. Status={resp.status_code}, "
+                f"body[:300]={resp.text[:300]!r}, "
+                f"cookies={dict(self._client.cookies)}"
+            )
         body = resp.text.strip()
 
         # Если в ответе есть "|" — это блокировка аккаунта или ошибка
@@ -184,11 +231,34 @@ class BonchClient:
         return str(user_id)
 
     async def is_logged_in(self) -> bool:
-        """Живая ли ещё сессия?"""
-        resp = await self._client.get(
-            "/cabinet/", params={"login": "yes"}, follow_redirects=False
-        )
-        return resp.status_code == 200 and "login=yes" in str(resp.url)
+        """
+        Живая ли ещё сессия?
+
+        У Бонча сессионная кука называется `miden` (не PHPSESSID, как в стандартном PHP).
+        Если её нет или GET /cabinet/?login=yes редиректит на ?login=no — сессия протухла.
+        """
+        # Быстрая проверка: есть ли вообще кука miden?
+        has_miden = bool(self._client.cookies.get("miden"))
+        if not has_miden:
+            log.debug("is_logged_in: кука miden отсутствует")
+            return False
+        # Полная проверка: GET кабинета без follow_redirects.
+        # Если сессия жива — 200. Если истекла — 302 на /cabinet/?login=no.
+        try:
+            resp = await self._client.get(
+                "/cabinet/", params={"login": "yes"}, follow_redirects=False
+            )
+        except httpx.HTTPError as e:
+            log.debug("is_logged_in: HTTP error %s", e)
+            return False
+        if resp.status_code == 200:
+            return True
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location", "")
+            # Если редирект на login=no — сессия протухла.
+            # Любой другой редирект — будем считать, что сессия жива.
+            return "login=no" not in location
+        return False
 
     # ───────────────────────────────────────────────────── SCHEDULE ──
 
